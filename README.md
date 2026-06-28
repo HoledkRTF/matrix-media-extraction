@@ -36,4 +36,4 @@ A tool to extract and download all media from Matrix chat rooms, including E2E e
 
 ## Future Plans
 
-I plan to expand this tool to include entire room backups—not just media, but also text messages, reactions, and threaded replies. I haven't gotten around to implementing that yet because pulling full chat histories and parsing every reaction was eating up way too much storage and time during testing. For now, it handles the heavy lifting of saving your media.
+Full room backups are missing from this release. Polling the Matrix `/messages` API to pull text, threaded replies, & JSON reaction events balloons a 50 MB media backup into a 2 GB database file that takes 45 minutes to parse. I am restricting this tool to media extraction until I can write a parser that doesn't waste disk space on unneeded sync tokens.
