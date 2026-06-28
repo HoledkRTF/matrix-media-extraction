@@ -1,0 +1,13 @@
+# Ignored files
+venv/
+.env
+cache/
+store/
+downloads/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+*.zip
