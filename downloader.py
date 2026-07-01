@@ -97,6 +97,22 @@ class MediaDownloader:
         timed_out = False
         events_processed = 0
 
+        # Process new events pulled by the initial sync (newest to oldest)
+        if hasattr(room, "timeline") and room.timeline and hasattr(room.timeline, "events"):
+            for event in reversed(room.timeline.events):
+                if not newest_event_id:
+                    newest_event_id = event.event_id
+                    
+                if event.event_id == bookmark:
+                    hit_bookmark = True
+                    break
+                    
+                media_entry = self._extract_media_from_event(room_id, event)
+                if media_entry:
+                    found_media.append(media_entry)
+                
+                events_processed += 1
+
         try:
             while token and not hit_bookmark:
                 try:
