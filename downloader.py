@@ -237,7 +237,8 @@ class MediaDownloader:
         seen = set()
         unique_media = []
         for m in media_list:
-            sig = (m.get("timestamp_ms"), m.get("url"))
+            url = m.get("url") or (m.get("file_info", {}).get("url") if m.get("file_info") else None)
+            sig = (m.get("timestamp_ms"), url, m.get("body"))
             if sig not in seen:
                 seen.add(sig)
                 unique_media.append(m)
