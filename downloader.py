@@ -200,8 +200,17 @@ class MediaDownloader:
         return None
 
     def _append_media_to_cache(self, cache, media_entries):
-        """Append a list of media entry dicts to the cache's media_list."""
+        """Append a list of media entry dicts to the cache's media_list and deduplicate."""
         cache["media_list"].extend(media_entries)
+        seen = set()
+        unique = []
+        for m in cache["media_list"]:
+            url = m.get("url") or (m.get("file_info", {}).get("url") if m.get("file_info") else None)
+            sig = (m.get("timestamp_ms"), url, m.get("body"))
+            if sig not in seen:
+                seen.add(sig)
+                unique.append(m)
+        cache["media_list"] = unique
 
     async def download_media_from_room(self, room_id, progress_callback=None, only_oldest=False):
         """Downloads all media using the JSON cache instead of API fetching."""
