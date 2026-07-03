@@ -2,14 +2,14 @@
 
 A tool to extract and download all media from Matrix chat rooms, including E2E encrypted rooms. It scans room histories backwards, downloading images, videos, and files, and properly deduplicates them so you don't end up with massive storage waste from identical forwarded files.
 
-## Features
+## Shit it do
 
-- Downloads media from both encrypted and unencrypted Matrix rooms.
-- Prevents storage bloat by hashing files and skipping exact duplicates.
-- Resumes incomplete scans using a local cache.
-- Command-line interface with progress bars and detailed room statistics.
+- Downloads media from both unencrypted and encrypted(OML i hate matrix so much) Matrix rooms.
+- Prevents storage bloat by hashing files and skipping exact duplicates(i dont have space, ts too expensive).
+- Resumes incomplete scans using a local cache(maybe kinda useless).
+- Command-line interface with progress bars and detailed room statistics(storage).
 
-## Setup Instructions
+## Setup Instructions(AI my goat)
 
 1. **Install Python**: Make sure you have Python 3 installed.
 2. **Clone the repository**: Download this code to your machine.
@@ -36,4 +36,4 @@ A tool to extract and download all media from Matrix chat rooms, including E2E e
 
 ## Future Plans
 
-I plan to expand this tool to include entire room backups—not just media, but also text messages, reactions, and threaded replies. I haven't gotten around to implementing that yet because pulling full chat histories and parsing every reaction was eating up way too much storage and time during testing. For now, it handles the heavy lifting of saving your media.
+I plan to expand this tool to include entire room backups—not just media, but also text messages, reactions, and threaded replies. But it was just extremely storage intensive plus my pc was waiting half the time just for the matrix servers to respond to me in the first place, i genuienly cant believe how unoptimized matrix servers are, it makes sense why the servers im a part of decided to stop hosting them ngl, if i had the hardware to host a large server it still might not be worth the effort. Using element i always saw the 
