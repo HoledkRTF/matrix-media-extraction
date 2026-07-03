@@ -6,8 +6,11 @@ import mimetypes
 import hashlib
 import vodozemac
 from nio.responses import RoomMessagesResponse
-from nio.events.room_events import RoomMessageMedia, MegolmEvent
+from nio.events.room_events import RoomMessageMedia, MegolmEvent, RoomMessageText
 from nio.crypto import decrypt_attachment
+from PIL import Image
+import imagehash
+import io
 
 CACHE_DIR = "cache"
 
@@ -19,6 +22,8 @@ class MediaDownloader:
         self._megolm_sessions = {}
         self._current_room_sizes = {}
         self._current_room_hashes = {}
+        self._current_room_phashes = set()
+        self._phash_db_path = None
         self._existing_files = set()
         self._dedup_lock = asyncio.Lock()
 
@@ -37,7 +42,17 @@ class MediaDownloader:
     def _scan_room_for_dedup(self, room_dir):
         self._current_room_sizes.clear()
         self._current_room_hashes.clear()
+        self._current_room_phashes.clear()
         self._existing_files.clear()
+        
+        self._phash_db_path = os.path.join(room_dir, "phash.json")
+        if os.path.exists(self._phash_db_path):
+            try:
+                with open(self._phash_db_path, "r", encoding="utf-8") as f:
+                    self._current_room_phashes = set(json.load(f))
+            except Exception:
+                pass
+
         if not os.path.isdir(room_dir):
             return
         for fname in os.listdir(room_dir):
@@ -179,7 +194,18 @@ class MediaDownloader:
 
     def _extract_media_from_event(self, room_id, event):
         """Extract media metadata from a single event. Returns a dict or None."""
-        if isinstance(event, RoomMessageMedia):
+        sender = getattr(event, "sender", "unknown")
+        if isinstance(event, RoomMessageText):
+            return {
+                "timestamp_ms": getattr(event, "server_timestamp", None),
+                "url": None,
+                "file_info": None,
+                "body": event.body or "",
+                "size": 0,
+                "mimetype": "text/plain",
+                "sender": sender,
+            }
+        elif isinstance(event, RoomMessageMedia):
             content = event.source.get("content", {})
             info = content.get("info", {})
             return {
@@ -189,6 +215,7 @@ class MediaDownloader:
                 "body": event.body or "unknown",
                 "size": info.get("size", 0),
                 "mimetype": info.get("mimetype", ""),
+                "sender": sender,
             }
         elif isinstance(event, MegolmEvent):
             session_id = event.session_id
@@ -201,7 +228,18 @@ class MediaDownloader:
                 event_json = json.loads(plaintext.decode("utf-8"))
                 content = event_json.get("content", event_json)
                 msgtype = content.get("msgtype", "")
-                if msgtype in ("m.image", "m.video", "m.audio", "m.file"):
+                
+                if msgtype == "m.text":
+                    return {
+                        "timestamp_ms": getattr(event, "server_timestamp", None),
+                        "url": None,
+                        "file_info": None,
+                        "body": content.get("body", ""),
+                        "size": 0,
+                        "mimetype": "text/plain",
+                        "sender": sender,
+                    }
+                elif msgtype in ("m.image", "m.video", "m.audio", "m.file"):
                     info = content.get("info", {})
                     return {
                         "timestamp_ms": getattr(event, "server_timestamp", None),
@@ -210,6 +248,7 @@ class MediaDownloader:
                         "body": content.get("body", "unknown"),
                         "size": info.get("size", 0),
                         "mimetype": info.get("mimetype", ""),
+                        "sender": sender,
                     }
             except Exception:
                 pass
@@ -358,7 +397,65 @@ class MediaDownloader:
             
             await asyncio.gather(*(download_one(m) for m in media_list))
             
+        self._save_phash_db()
+        await self.export_html(room_id)
         return stats
+
+    def _save_phash_db(self):
+        if self._phash_db_path:
+            try:
+                with open(self._phash_db_path, "w", encoding="utf-8") as f:
+                    json.dump(list(self._current_room_phashes), f)
+            except Exception:
+                pass
+
+    def _process_image(self, data, filename):
+        """
+        Loads image data, computes perceptual hash, strips EXIF, 
+        and returns (new_data, phash_str).
+        Returns (data, None) if not an image or fails.
+        """
+        ext = os.path.splitext(filename)[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".webp", ".bmp"):
+            return data, None
+            
+        try:
+            with Image.open(io.BytesIO(data)) as img:
+                phash = str(imagehash.phash(img))
+                out = io.BytesIO()
+                if img.mode in ("RGBA", "P") and ext in (".jpg", ".jpeg"):
+                    img = img.convert("RGB")
+                img.save(out, format=img.format or "PNG")
+                return out.getvalue(), phash
+        except Exception:
+            return data, None
+
+    async def _transcode_video(self, filepath, timestamp_ms):
+        ext = os.path.splitext(filepath)[1].lower()
+        if ext == ".mp4":
+            return
+            
+        out_path = os.path.splitext(filepath)[0] + ".mp4"
+        cmd = [
+            "ffmpeg", "-y", "-i", filepath,
+            "-c:v", "h264_nvenc", "-crf", "18", "-preset", "slow",
+            "-c:a", "aac", "-b:a", "192k",
+            out_path
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+            await proc.wait()
+            if proc.returncode == 0 and os.path.exists(out_path):
+                os.remove(filepath)
+                if timestamp_ms:
+                    t_sec = timestamp_ms / 1000.0
+                    os.utime(out_path, (t_sec, t_sec))
+        except Exception:
+            pass
 
     async def _download_media(self, url, file_info, body, room_dir, timestamp_ms=None):
         target_url = url or (file_info.get("url") if file_info else None)
@@ -419,6 +516,8 @@ class MediaDownloader:
                 decrypt_attachment, data, file_info["key"]["k"], file_info["hashes"]["sha256"], file_info["iv"]
             )
             
+        data, phash = await asyncio.to_thread(self._process_image, data, filename)
+            
         data_size = len(data)
         data_hash = None
 
@@ -429,6 +528,9 @@ class MediaDownloader:
 
         # --- Dedup check (narrow lock: only covers hash comparison + dict update) ---
         async with self._dedup_lock:
+            if phash and phash in self._current_room_phashes:
+                return "DEDUPED"
+
             if data_size in self._current_room_sizes:
                 if data_hash is None:
                     data_hash = await asyncio.to_thread(lambda d: hashlib.sha256(d).hexdigest(), data)
@@ -452,6 +554,8 @@ class MediaDownloader:
             if data_hash is None:
                 data_hash = await asyncio.to_thread(lambda d: hashlib.sha256(d).hexdigest(), data)
             self._current_room_hashes[filepath] = data_hash
+            if phash:
+                self._current_room_phashes.add(phash)
 
         # --- File write happens OUTSIDE the lock so other workers aren't blocked ---
         def _write_file(p, d, ts):
@@ -465,5 +569,85 @@ class MediaDownloader:
         
         # Add to existing files set for future O(1) lookups
         self._existing_files.add(filename)
+        
+        # Trigger background transcoding for heavy video formats
+        ext = os.path.splitext(filename)[1].lower()
+        if ext in (".mkv", ".mov", ".avi", ".wmv", ".flv", ".webm"):
+            asyncio.create_task(self._transcode_video(filepath, timestamp_ms))
 
         return "DOWNLOADED"
+
+    async def export_html(self, room_id):
+        room = self.client.rooms.get(room_id)
+        if not room: return
+        room_name = room.display_name
+        room_name = "".join(c for c in room_name if c.isalnum() or c in " ._-[]").strip() or room_id.replace("!", "_").replace(":", "_")
+        
+        cache_path = os.path.join(CACHE_DIR, f"{room_id.replace('!', '_').replace(':', '_')}.json")
+        if not os.path.exists(cache_path): return
+        
+        with open(cache_path, "r", encoding="utf-8") as f:
+            cache = json.load(f)
+            
+        media_list = cache.get("media_list", [])
+        if not media_list: return
+        
+        media_list.sort(key=lambda x: x.get("timestamp_ms") or 0)
+        
+        room_dir = os.path.join(self.download_dir, room_name)
+        os.makedirs(room_dir, exist_ok=True)
+        html_path = os.path.join(room_dir, "index.html")
+        
+        html = [
+            "<html><head><meta charset='utf-8'>",
+            f"<title>{room_name} Chat Export</title>",
+            "<style>",
+            "body { font-family: sans-serif; background: #1e1e1e; color: #fff; max-width: 800px; margin: 0 auto; padding: 20px; }",
+            ".msg { margin-bottom: 20px; padding: 10px; background: #2d2d2d; border-radius: 8px; }",
+            ".sender { font-weight: bold; color: #4da6ff; margin-bottom: 5px; }",
+            ".time { color: #888; font-size: 0.8em; margin-left: 10px; }",
+            ".text { white-space: pre-wrap; line-height: 1.4; }",
+            ".media img, .media video { max-width: 100%; max-height: 500px; border-radius: 4px; margin-top: 10px; }",
+            "</style></head><body>",
+            f"<h1>{room_name} Chat Export</h1>"
+        ]
+        
+        files_in_dir = os.listdir(room_dir) if os.path.exists(room_dir) else []
+        
+        for m in media_list:
+            sender = m.get("sender", "unknown")
+            ts = m.get("timestamp_ms")
+            dt_str = datetime.datetime.fromtimestamp(ts/1000).strftime("%Y-%m-%d %H:%M:%S") if ts else ""
+            
+            # Simple sanitization
+            body = m.get('body', '').replace('<', '&lt;').replace('>', '&gt;')
+            sender = sender.replace('<', '&lt;').replace('>', '&gt;')
+            
+            html.append(f"<div class='msg'><div class='sender'>{sender}<span class='time'>{dt_str}</span></div>")
+            
+            if m.get("mimetype") == "text/plain":
+                html.append(f"<div class='text'>{body}</div>")
+            else:
+                url = m.get("url") or (m.get("file_info", {}).get("url") if m.get("file_info") else None)
+                if url and url.startswith("mxc://"):
+                    media_id = url[6:].split("/", 1)[-1]
+                    local_file = None
+                    for f_name in files_in_dir:
+                        if media_id in f_name:
+                            local_file = f_name
+                            break
+                    if local_file:
+                        if local_file.endswith(".mp4") or local_file.endswith(".webm"):
+                            html.append(f"<div class='media'><video controls src='{local_file}'></video></div>")
+                        else:
+                            html.append(f"<div class='media'><img loading='lazy' src='{local_file}' /></div>")
+                    else:
+                        html.append(f"<div class='media'><em>[Media missing]</em></div>")
+                else:
+                    html.append(f"<div class='text'><em>[Unsupported Media]</em></div>")
+            html.append("</div>")
+            
+        html.append("</body></html>")
+        
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(html))

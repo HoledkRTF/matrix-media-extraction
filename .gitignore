@@ -1,13 +1,7 @@
-# Ignored files
-venv/
-.env
-cache/
-store/
 downloads/
+cache/
+venv/
+venv_gpu/
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
-.Python
-env/
-*.zip
+.env
+*.sqlite

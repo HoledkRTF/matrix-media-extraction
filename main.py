@@ -23,6 +23,7 @@ from cli import (
 )
 from downloader import MediaDownloader
 from key_export import decrypt_key_export, build_session_map
+from nio.events.room_events import RoomMessageMedia, MegolmEvent, RoomMessageText
 
 
 async def main():
@@ -85,54 +86,101 @@ async def main():
             except Exception as e:
                 console.print(f"[bold red]Failed to import keys: {e}[/bold red]")
 
-        # --- Pre-Menu Delta Scanning ---
-        room_statuses = {}
-        scan_semaphore = asyncio.Semaphore(5)
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TaskProgressColumn(),
-            TextColumn("[green]{task.completed}/{task.total} rooms"),
-            console=console,
-        ) as progress:
-            scan_task = progress.add_task("[cyan]Initializing scans...", total=len(rooms))
+        # --- Pre-Menu Delta Scanning (Moved to Option 1) ---
+        async def perform_delta_scan():
+            room_statuses = {}
+            scan_semaphore = asyncio.Semaphore(5)
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                TaskProgressColumn(),
+                TextColumn("[green]{task.completed}/{task.total} rooms"),
+                console=console,
+            ) as progress:
+                scan_task = progress.add_task("[cyan]Initializing scans...", total=len(rooms))
+                
+                async def scan_and_record(r_id):
+                    async with scan_semaphore:
+                        room_info = rooms.get(r_id, (r_id, False))
+                    room_name = room_info[0] if isinstance(room_info, tuple) else room_info
+                    progress.update(scan_task, description=f"[cyan]Scanning: {room_name[:45]}")
+                    try:
+                        count, cached = await downloader.delta_scan_room(r_id)
+                        # Read the cache to compute total size and media count
+                        cache_path = os.path.join("cache", f"{r_id.replace('!', '_').replace(':', '_')}.json")
+                        total_size = 0
+                        media_count = 0
+                        if os.path.exists(cache_path):
+                            with open(cache_path, "r", encoding="utf-8") as f:
+                                cache_data = json.load(f)
+                            media_list = cache_data.get("media_list", [])
+                            media_count = len(media_list)
+                            total_size = sum(m.get("size", 0) or 0 for m in media_list)
+                        room_statuses[r_id] = (media_count, cached, total_size)
+                    except Exception as e:
+                        console.print(f"[bold red]Error scanning {room_name}: {e}[/bold red]")
+                        room_statuses[r_id] = (None, False, 0)
+                    finally:
+                        # Update text as rooms finish so it doesn't get stuck!
+                        progress.update(scan_task, description=f"[cyan]Finished: {room_name[:45]}")
+                        progress.advance(scan_task)
+                
+                await asyncio.gather(*(scan_and_record(rid) for rid in rooms.keys()))
+            return room_statuses
+
+        import argparse
+        parser = argparse.ArgumentParser(description="Matrix Media Archiver")
+        parser.add_argument("--watch", action="store_true", help="Run in continuous watch mode")
+        args = parser.parse_args()
+
+        if args.watch:
+            console.print("\n[bold cyan]Entering Watch Mode. Waiting for new messages...[/bold cyan]")
             
-            async def scan_and_record(r_id):
-                async with scan_semaphore:
-                    room_info = rooms.get(r_id, (r_id, False))
-                room_name = room_info[0] if isinstance(room_info, tuple) else room_info
-                progress.update(scan_task, description=f"[cyan]Scanning: {room_name[:45]}")
-                try:
-                    count, cached = await downloader.delta_scan_room(r_id)
-                    # Read the cache to compute total size and media count
-                    cache_path = os.path.join("cache", f"{r_id.replace('!', '_').replace(':', '_')}.json")
-                    total_size = 0
-                    media_count = 0
-                    if os.path.exists(cache_path):
-                        with open(cache_path, "r", encoding="utf-8") as f:
-                            cache_data = json.load(f)
-                        media_list = cache_data.get("media_list", [])
-                        media_count = len(media_list)
-                        total_size = sum(m.get("size", 0) or 0 for m in media_list)
-                    room_statuses[r_id] = (media_count, cached, total_size)
-                except Exception as e:
-                    console.print(f"[bold red]Error scanning {room_name}: {e}[/bold red]")
-                    room_statuses[r_id] = (None, False, 0)
-                finally:
-                    # Update text as rooms finish so it doesn't get stuck!
-                    progress.update(scan_task, description=f"[cyan]Finished: {room_name[:45]}")
-                    progress.advance(scan_task)
+            def _handle_event(room, event):
+                async def _task():
+                    try:
+                        await downloader.delta_scan_room(room.room_id)
+                        await downloader.download_media_from_room(room.room_id)
+                        # Optionally export HTML? We'll add this later if requested
+                        # await downloader.export_html(room.room_id)
+                    except Exception as e:
+                        console.print(f"[bold red]Watch mode error in {room.room_id}: {e}[/bold red]")
+                
+                asyncio.create_task(_task())
+                
+            client_wrapper.client.add_event_callback(_handle_event, RoomMessageMedia)
+            client_wrapper.client.add_event_callback(_handle_event, MegolmEvent)
+            client_wrapper.client.add_event_callback(_handle_event, RoomMessageText)
             
-            await asyncio.gather(*(scan_and_record(rid) for rid in rooms.keys()))
+            try:
+                await client_wrapper.client.sync_forever(timeout=30000, full_state=True)
+            except asyncio.CancelledError:
+                pass
+            return
 
         # --- Main loop for selection and downloading ---
+        from cli import Prompt
         while True:
+            console.print("\n[bold cyan]--- Main Menu ---[/bold cyan]")
+            console.print("[1] Download Media (Select Rooms)")
+            console.print("[2] Exit")
+            console.print("[3] Retroactively Process Old Media (Transcode Videos)")
+            choice = Prompt.ask("Select an option", choices=["1", "2", "3"], default="1")
+            
+            if choice == "2":
+                break
+            elif choice == "3":
+                import retrofill
+                await retrofill.process_backlog("downloads")
+                continue
+
             # --- Room selection ---
+            room_statuses = await perform_delta_scan()
             selected = select_rooms(rooms, room_statuses)
             if not selected:
-                console.print("[bold yellow]No rooms selected. Exiting.[/bold yellow]")
-                break
+                console.print("[bold yellow]No rooms selected. Returning to menu.[/bold yellow]")
+                continue
 
             # --- Download ---
             with Progress(
